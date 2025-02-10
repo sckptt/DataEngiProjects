@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from kafka import KafkaProducer
 from pyspark.sql import SparkSession
 from pyspark.sql.types import StructType, StringType, ArrayType, LongType, StructField
-from pyspark.sql.functions import from_json, col
+from pyspark.sql.functions import from_json, col, from_unixtime, year, month, dayofmonth, dayofweek, hour, minute
 from spotipy.oauth2 import SpotifyOAuth
 
 findspark.init()
@@ -83,17 +83,41 @@ def check_duplicates(pp : dict) -> bool:
 		return True
 
 #TO_DO - work on log level 
-def get_data_from_kafka():
-	my_spark = SparkSession.builder \
-    	.appName("SpotifyTracks") \
-    	.master("local[*]") \
-    	.config("spark.driver.extraJavaOptions", "-Duser.library.path=$JAVA_HOME/lib") \
-   		.config("spark.executor.extraJavaOptions", "-Duser.library.path=$JAVA_HOME/lib") \
-    	.config("spark.java.options", "-Dfile.encoding=UTF-8") \
-    	.config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.4") \
-    	.config("spark.ui.enabled", "false") \
-    	.getOrCreate()
+def create_spark_connection():
+	try:
+		spark_connection = SparkSession.builder \
+			.appName("SpotifyTracks") \
+			.master("local[*]") \
+			.config("spark.driver.extraJavaOptions", "-Duser.library.path=$JAVA_HOME/lib") \
+			.config("spark.executor.extraJavaOptions", "-Duser.library.path=$JAVA_HOME/lib") \
+			.config("spark.java.options", "-Dfile.encoding=UTF-8") \
+			.config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.4") \
+			.config("spark.ui.enabled", "false") \
+			.getOrCreate()
+		
+		spark_connection.sparkContext.setLogLevel("ERROR")
+		print("Spark connection is created")
+	except Exception as e:
+		print(f"Couldn't create the spark session due to exception {e}")
 
+	return spark_connection
+
+def create_kafka_connection(spark_connection):
+	try:
+		data_frame = spark_connection \
+			.readStream \
+			.format("kafka") \
+			.option("kafka.bootstrap.servers", "localhost:9092") \
+			.option("subscribe", "spotify_tracks") \
+			.option("startingOffsets", "earliest") \
+			.load()
+		print("Spark connected with Kafka successfully")
+	except Exception as e:
+		print(f"Couldn't create a dataframe due to exception {e}")
+
+	return data_frame
+
+def parse_streaming_schema(data_frame):
 	schema = StructType([
 		StructField("device_name", StringType(), True),
 		StructField("device_type", StringType(), True),
@@ -107,24 +131,39 @@ def get_data_from_kafka():
 		StructField("timestamp", LongType(), True),
 		StructField("playing_type", StringType(), True)])
 
-	data_frame = my_spark \
-        .readStream \
-        .format("kafka") \
-        .option("kafka.bootstrap.servers", "localhost:9092") \
-        .option("subscribe", "spotify_tracks") \
-        .option("startingOffsets", "earliest") \
-        .load()
-    
 	parsed_df = data_frame \
         .selectExpr("CAST(value AS STRING) as json_string") \
         .select(from_json(col("json_string"), schema).alias("data")) \
         .select("data.*")
+
+	return parsed_df
+
+def add_datetime_columns(data_frame):
+	enriched_df = data_frame.withColumn("timestamp", from_unixtime(col("timestamp") / 1000)) \
+		.withColumn("year", year(col("timestamp"))) \
+		.withColumn("month", month(col("timestamp"))) \
+		.withColumn("day", dayofmonth(col("timestamp"))) \
+		.withColumn("weekday", dayofweek(col("timestamp"))) \
+		.withColumn("hour", hour(col("timestamp"))) \
+		.withColumn("minute", minute(col("timestamp")))
 	
-	parsed_df.writeStream \
+	# times_played = enriched_df.groupBy("song_id", "day", "month", "year").agg(count("song_id").alias("times_played"))
+	# deduplicated_df = enriched_df.dropDuplicates(["song_id", "day", "month", "year"])
+	# final_df = deduplicated_df.join(times_played, on=["song_id", "day", "month", "year"])
+
+	return enriched_df
+
+def process_kafka_stream():
+	spark_connection = create_spark_connection()
+	data_frame = create_kafka_connection(spark_connection)
+	parsed_df = parse_streaming_schema(data_frame)
+	enriched_data = add_datetime_columns(parsed_df)
+	
+	enriched_data.writeStream \
 		.outputMode("append") \
 		.format("console") \
 		.option("truncate", False) \
-		.start() 
+		.start()
 
 def send_playback_to_kafka():
 	sp = create_spotify_client()
@@ -134,7 +173,7 @@ def send_playback_to_kafka():
 			parsed_playback = parse_playback(playback=playback)
 			if parsed_playback and check_duplicates(parsed_playback):
 				producer.send("spotify_tracks", value=parsed_playback)
-				get_data_from_kafka()
+				process_kafka_stream()
 			else:
 				print("Skipping duplicate or invalid track")
 		else:
