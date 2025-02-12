@@ -7,82 +7,88 @@ import time
 from dotenv import load_dotenv
 from kafka import KafkaProducer
 from pyspark.sql import SparkSession
-from pyspark.sql.types import StructType, StringType, ArrayType, LongType, StructField
 from pyspark.sql.functions import from_json, col, from_unixtime, year, month, dayofmonth, dayofweek, hour, minute
+from pyspark.sql.types import StructType, StringType, ArrayType, LongType, StructField
 from spotipy.oauth2 import SpotifyOAuth
 
 findspark.init()
 load_dotenv()
 
 def create_spotify_client():
-	my_id = os.getenv("SPOTIPY_CLIENT_ID")
-	my_secret= os.getenv("SPOTIPY_CLIENT_SECRET")
-	my_redirect_uri = os.getenv("SPOTIPY_REDIRECT_URI")
+	try:
+		my_id = os.getenv("SPOTIPY_CLIENT_ID")
+		my_secret= os.getenv("SPOTIPY_CLIENT_SECRET")
+		my_redirect_uri = os.getenv("SPOTIPY_REDIRECT_URI")
 
-	if not my_id or not my_secret or not my_redirect_uri:
-		raise ValueError("Spotify API credentials are missing! Please check your environmental variables!")
-	
-	my_scopes = "user-read-playback-state"
-	my_sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
-		client_id=my_id,
-		client_secret=my_secret,
-		redirect_uri=my_redirect_uri,
-		scope=my_scopes))
-	return my_sp
+		if not my_id or not my_secret or not my_redirect_uri:
+			raise ValueError("Spotify API credentials are missing! Please check your environmental variables!")
+		
+		my_scopes = "user-read-playback-state"
+		my_sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
+			client_id=my_id,
+			client_secret=my_secret,
+			redirect_uri=my_redirect_uri,
+			scope=my_scopes))
+		print("Spotify client is created")
+		return my_sp
+	except Exception as e:
+		print(f"Couldn't create the spotify client due to exception {e}")
+		return None
 
 def parse_playback(playback : dict) -> dict:
-	if playback["currently_playing_type"] == "episode":
+	try:
+		if playback["currently_playing_type"] == "episode":
+			return None
+		
+		elif playback["currently_playing_type"] == "track":
+			device_name = playback["device"]["name"]
+			device_type = playback["device"]["type"]
+			url = playback["context"]["external_urls"]["spotify"]
+			artists_name = []
+			for i in range(len(playback["item"]["artists"])):
+				name = playback["item"]["artists"][i]["name"]
+				artists_name.append(name)
+			artists_id = []
+			for i in range(len(playback["item"]["artists"])):
+				artist_id = playback["item"]["artists"][i]["id"]
+				artists_id.append(artist_id)
+			album_name = playback["item"]["album"]["name"]
+			album_picture = playback["item"]["album"]["images"][0]["url"]
+			song_name = playback["item"]["name"]
+			song_id = playback["item"]["id"]
+			timestamp = playback["timestamp"]
+			playing_type = playback["currently_playing_type"]
+			return {
+				"device_name" : device_name,
+				"device_type" : device_type,
+				"url" : url,
+				"artists_name" : artists_name,
+				"artist_id" : artists_id,
+				"album_name" : album_name,
+				"album_picture" : album_picture,
+				"song_name" : song_name,
+				"song_id" : song_id,
+				"timestamp" : timestamp,
+				"playing_type" : playing_type
+			}
+	except KeyError as e:
+		print(f"Key error occured: {e}")
 		return None
-	
-	elif playback["currently_playing_type"] == "track":
-		device_name = playback["device"]["name"]
-		device_type = playback["device"]["type"]
-		url = playback["context"]["external_urls"]["spotify"]
-		artists_name = []
-		for i in range(len(playback["item"]["artists"])):
-			name = playback["item"]["artists"][i]["name"]
-			artists_name.append(name)
-		artists_id = []
-		for i in range(len(playback["item"]["artists"])):
-			artist_id = playback["item"]["artists"][i]["id"]
-			artists_id.append(artist_id)
-		album_name = playback["item"]["album"]["name"]
-		album_picture = playback["item"]["album"]["images"][0]["url"]
-		song_name = playback["item"]["name"]
-		song_id = playback["item"]["id"]
-		timestamp = playback["timestamp"]
-		playing_type = playback["currently_playing_type"]
-		return {
-			"device_name" : device_name,
-			"device_type" : device_type,
-			"url" : url,
-			"artists_name" : artists_name,
-			"artist_id" : artists_id,
-			"album_name" : album_name,
-			"album_picture" : album_picture,
-			"song_name" : song_name,
-			"song_id" : song_id,
-			"timestamp" : timestamp,
-			"playing_type" : playing_type
-		}
+	except Exception as e:
+		print(f"An error occured while parsing playback: {e}")
+		return None
 
-producer = KafkaProducer(bootstrap_servers="localhost:9092",
-						value_serializer=lambda v: json.dumps(v).encode("utf-8"))
-
-my_redis = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
-
-def check_duplicates(pp : dict) -> bool:
+def check_duplicates(pp : dict, redis_client: redis.Redis) -> bool:
 	song_id = pp["song_id"]
 	timestamp = pp["timestamp"] / 1000
 	unique_key = f"{song_id}:{timestamp}"
 
-	if my_redis.exists(unique_key):
+	if redis_client.exists(unique_key):
 		return False
 	else:
-		my_redis.set(unique_key, "loaded", ex=600)
+		redis_client.set(unique_key, "loaded", ex=600)
 		return True
 
-#TO_DO - work on log level 
 def create_spark_connection():
 	try:
 		spark_connection = SparkSession.builder \
@@ -97,10 +103,10 @@ def create_spark_connection():
 		
 		spark_connection.sparkContext.setLogLevel("ERROR")
 		print("Spark connection is created")
+		return spark_connection
 	except Exception as e:
 		print(f"Couldn't create the spark session due to exception {e}")
-
-	return spark_connection
+		return None
 
 def create_kafka_connection(spark_connection):
 	try:
@@ -110,12 +116,14 @@ def create_kafka_connection(spark_connection):
 			.option("kafka.bootstrap.servers", "localhost:9092") \
 			.option("subscribe", "spotify_tracks") \
 			.option("startingOffsets", "earliest") \
+			.option("enable.auto.commit", "true") \
+    		.option("group.id", "spotify_consumer_group") \
 			.load()
 		print("Spark connected with Kafka successfully")
+		return data_frame
 	except Exception as e:
 		print(f"Couldn't create a dataframe due to exception {e}")
-
-	return data_frame
+		return None
 
 def parse_streaming_schema(data_frame):
 	schema = StructType([
@@ -131,33 +139,49 @@ def parse_streaming_schema(data_frame):
 		StructField("timestamp", LongType(), True),
 		StructField("playing_type", StringType(), True)])
 
-	parsed_df = data_frame \
-        .selectExpr("CAST(value AS STRING) as json_string") \
-        .select(from_json(col("json_string"), schema).alias("data")) \
-        .select("data.*")
-
-	return parsed_df
+	try:
+		parsed_df = data_frame \
+			.selectExpr("CAST(value AS STRING) as json_string") \
+			.select(from_json(col("json_string"), schema).alias("data")) \
+			.select("data.*")
+		return parsed_df
+	except Exception as e:
+		print(f"Couldn't parse a data frame due to exception {e}")
+		return None
 
 def add_datetime_columns(data_frame):
-	enriched_df = data_frame.withColumn("timestamp", from_unixtime(col("timestamp") / 1000)) \
-		.withColumn("year", year(col("timestamp"))) \
-		.withColumn("month", month(col("timestamp"))) \
-		.withColumn("day", dayofmonth(col("timestamp"))) \
-		.withColumn("weekday", dayofweek(col("timestamp"))) \
-		.withColumn("hour", hour(col("timestamp"))) \
-		.withColumn("minute", minute(col("timestamp")))
-	
-	# times_played = enriched_df.groupBy("song_id", "day", "month", "year").agg(count("song_id").alias("times_played"))
-	# deduplicated_df = enriched_df.dropDuplicates(["song_id", "day", "month", "year"])
-	# final_df = deduplicated_df.join(times_played, on=["song_id", "day", "month", "year"])
-
-	return enriched_df
+	try:
+		enriched_df = data_frame.withColumn("timestamp", from_unixtime(col("timestamp") / 1000)) \
+			.withColumn("year", year(col("timestamp"))) \
+			.withColumn("month", month(col("timestamp"))) \
+			.withColumn("day", dayofmonth(col("timestamp"))) \
+			.withColumn("weekday", dayofweek(col("timestamp"))) \
+			.withColumn("hour", hour(col("timestamp"))) \
+			.withColumn("minute", minute(col("timestamp")))
+		# times_played = enriched_df.groupBy("song_id", "day", "month", "year").agg(count("song_id").alias("times_played"))
+		# deduplicated_df = enriched_df.dropDuplicates(["song_id", "day", "month", "year"])
+		# final_df = deduplicated_df.join(times_played, on=["song_id", "day", "month", "year"])
+		return enriched_df
+	except Exception as e:
+		print(f"Couldn't add datetime columns due to exception {e}")
+		return None
 
 def process_kafka_stream():
 	spark_connection = create_spark_connection()
+	if not spark_connection:
+		return
+	
 	data_frame = create_kafka_connection(spark_connection)
+	if not data_frame:
+		return
+	
 	parsed_df = parse_streaming_schema(data_frame)
+	if not parsed_df:
+		return
+	
 	enriched_data = add_datetime_columns(parsed_df)
+	if not enriched_data:
+		return
 	
 	enriched_data.writeStream \
 		.outputMode("append") \
@@ -166,19 +190,32 @@ def process_kafka_stream():
 		.start()
 
 def send_playback_to_kafka():
-	sp = create_spotify_client()
-	while True:
-		playback = sp.current_playback()
-		if playback:
-			parsed_playback = parse_playback(playback=playback)
-			if parsed_playback and check_duplicates(parsed_playback):
-				producer.send("spotify_tracks", value=parsed_playback)
-				process_kafka_stream()
-			else:
-				print("Skipping duplicate or invalid track")
-		else:
-			print("No active playback")
-		
-		time.sleep(120)
+	try:
+		sp = create_spotify_client()
+		if not sp:
+			return
+
+		producer = KafkaProducer(bootstrap_servers="localhost:9092",
+								value_serializer=lambda v: json.dumps(v).encode("utf-8"))
+
+		redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+
+		while True:
+			try:
+				playback = sp.current_playback()
+				if playback:
+					parsed_playback = parse_playback(playback=playback)
+					if parsed_playback and check_duplicates(parsed_playback, redis_client):
+						producer.send("spotify_tracks", value=parsed_playback)
+						process_kafka_stream()
+					else:
+						print("Skipping duplicate or invalid track")
+				else:
+					print("No active playback")
+				time.sleep(120)
+			except Exception as e:
+				print(f"An error occured in the playbsck loop: {e}")
+	except Exception as e:
+		print(f"An error occured while sending playback to Kafka: {e}")
 
 send_playback_to_kafka()
